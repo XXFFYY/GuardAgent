@@ -7,8 +7,77 @@ from openai import OpenAI
 from autogen.agentchat import Agent, UserProxyAgent, ConversableAgent
 from termcolor import colored
 import Levenshtein
+import re
 
 logger = logging.getLogger(__name__)
+
+import re
+
+
+def _message_to_text(message):
+    if isinstance(message, dict):
+        return message.get("content", "") or ""
+    if isinstance(message, str):
+        return message
+    return str(message)
+
+
+import re
+
+def _extract_python_code_block(text: str):
+    if not isinstance(text, str):
+        return None
+
+    # 1) 先匹配 ```python ... ```
+    m = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # 2) 再匹配普通 ``` ... ```
+    m = re.search(r"```\s*(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # 3) 再匹配 “Guardrail code:” 后面的裸代码，到 TERMINATE 为止
+    m = re.search(r"Guardrail code:\s*(.*?)(?:\n\s*TERMINATE\b|$)", text, re.DOTALL)
+    if m:
+        code = m.group(1).strip()
+        if "CheckAccess(" in code or "CheckRule(" in code or "list_of_database" in code:
+            return code
+
+    # 4) 最后兜底：如果整段文本里看起来就是代码，也直接收
+    if (
+        "CheckAccess(" in text
+        or "CheckRule(" in text
+        or "list_of_database" in text
+        or "summary_of_database" in text
+    ):
+        # 去掉结尾的 TERMINATE
+        text = re.sub(r"\n\s*TERMINATE\s*$", "", text.strip(), flags=re.DOTALL)
+        return text.strip()
+
+    return None
+
+
+def _wrap_code_with_result_block(code: str):
+    # 如果模型自己已经把结果块写进代码里，就不要重复追加
+    if (
+        "GuardAgent results:" in code
+        and "label:" in code
+        and "inaccessible_db:" in code
+        and "guardrailed_answer:" in code
+        and "(End of results)" in code
+    ):
+        return code
+
+    return code + """
+
+print("GuardAgent results:")
+print(f"label: {1 if access_denied else 0}")
+print(f"inaccessible_db: {inaccessible_database}")
+print(f"guardrailed_answer: {guardrailed_answer}")
+print("(End of results)")
+"""
 
 
 class GuardAgent(UserProxyAgent):
@@ -60,7 +129,10 @@ class GuardAgent(UserProxyAgent):
         from prompts_guard import SYSTEM_PROMPT_DECOMPOSITION
         messages = [{"role": "system", "content": SYSTEM_PROMPT_DECOMPOSITION},
                     {"role": "user", "content": query_message}]
-        client = OpenAI(api_key=config["api_key"])
+        client = OpenAI(
+            api_key=config["api_key"],
+            base_url=config.get("base_url"),
+        )
         while patience > 0:
             patience -= 1
             try:
@@ -126,14 +198,15 @@ class GuardAgent(UserProxyAgent):
                                                         subtasks=subtasks)
         return init_message
 
-    def send(self, message: Union[Dict, str], recipient: Agent, request_reply: Optional[bool] = None,
-             silent: Optional[bool] = False):
-        valid = self._append_oai_message(message, "assistant", recipient)
+    def send(self, message, recipient, request_reply=None, silent=False):
+        valid = self._append_oai_message(
+            message, "assistant", recipient, is_sending=True
+        )
         if valid:
             recipient.receive(message, self, request_reply, silent)
         else:
             raise ValueError(
-                "Message can't be converted into a valid ChatCompletion message. Either content or function_call must be provided."
+                "Message can't be converted into a valid ChatCompletion message."
             )
 
     def initiate_chat(self, recipient: "ConversableAgent", clear_history: Optional[bool] = True,
@@ -149,9 +222,37 @@ class GuardAgent(UserProxyAgent):
             silent: Optional[bool] = False,
     ):
         self._process_received_message(message, sender, silent)
+
+        # -------- fallback: 如果 assistant 返回的是 ```python 代码块，就直接执行 --------
+        incoming_text = _message_to_text(message)
+        code_block = _extract_python_code_block(incoming_text)
+
+        if code_block is not None:
+            print("\n[DEBUG] Fallback triggered: executing python code block directly")
+            wrapped_code = _wrap_code_with_result_block(code_block)
+
+            func_call = {
+                "name": "python",
+                "arguments": json.dumps({"cell": wrapped_code})
+            }
+
+            is_exec_success, result = self.execute_function(func_call)
+
+            print("[DEBUG] execute_function success:", is_exec_success)
+            print("[DEBUG] execute_function result:", result)
+
+            # 这里直接把执行结果文本送回去，并且不再请求对方继续回复
+            self.send(result["content"], sender, request_reply=False, silent=silent)
+            return
+        # ---------------------------------------------------------------------------
+
         if request_reply is False or request_reply is None and self.reply_at_receive[sender] is False:
             return
+
         reply = self.generate_reply(messages=self.chat_messages[sender], sender=sender)
+        print("\n[DEBUG] reply type:", type(reply))
+        print("[DEBUG] reply content:", reply)
+
         if reply is not None:
             self.send(reply, sender, silent=silent)
 
@@ -167,7 +268,10 @@ class GuardAgent(UserProxyAgent):
         messages = [{"role": "system",
                      "content": "You are an AI assistant that helps people debug their code. Only list one most possible reason to the errors."},
                     {"role": "user", "content": query_message}]
-        client = OpenAI(api_key=config["api_key"])
+        client = OpenAI(
+            api_key=config["api_key"],
+            base_url=config.get("base_url"),
+        )
         while patience > 0:
             patience -= 1
             try:
@@ -190,6 +294,8 @@ class GuardAgent(UserProxyAgent):
         return "Fail to diagnose the reasons to the errors."
 
     def execute_function(self, func_call):
+        print("\n[DEBUG] execute_function called")
+        print("[DEBUG] func_call =", func_call)
         """Execute a function call and return the result.
 
         Override this function to modify the way to execute a function call.
